@@ -16,6 +16,7 @@
 #  under the License.
 
 
+from functools import singledispatch
 from typing import (
     Any,
     Dict,
@@ -51,10 +52,37 @@ from pyiceberg.io import load_file_io
 from pyiceberg.partitioning import UNPARTITIONED_PARTITION_SPEC, PartitionSpec
 from pyiceberg.schema import Schema
 from pyiceberg.serializers import FromInputFile
-from pyiceberg.table import CommitTableRequest, CommitTableResponse, Table
+from pyiceberg.table import (
+    CommitTableRequest,
+    CommitTableResponse,
+    Table,
+    TableMetadata,
+)
 from pyiceberg.table.metadata import new_table_metadata
 from pyiceberg.table.sorting import UNSORTED_SORT_ORDER, SortOrder
 from pyiceberg.typedef import EMPTY_DICT
+from pyiceberg.types import (
+    BinaryType,
+    BooleanType,
+    DateType,
+    DecimalType,
+    DoubleType,
+    FixedType,
+    FloatType,
+    IcebergType,
+    IntegerType,
+    ListType,
+    LongType,
+    MapType,
+    NestedField,
+    PrimitiveType,
+    StringType,
+    StructType,
+    TimestampType,
+    TimestamptzType,
+    TimeType,
+    UUIDType,
+)
 
 BOTO_SESSION_CONFIG_KEYS = ["aws_secret_key_id", "aws_secret_access_key", "aws_session_token", "region_name", "profile_name"]
 
@@ -69,6 +97,16 @@ PROP_GLUE_TABLE_DATABASE_NAME = "DatabaseName"
 PROP_GLUE_TABLE_NAME = "Name"
 PROP_GLUE_TABLE_OWNER = "Owner"
 PROP_GLUE_TABLE_STORAGE_DESCRIPTOR = "StorageDescriptor"
+PROP_GLUE_TABLE_LOCATION = 'Location'
+PROP_GLUE_TABLE_COLUMNS = 'Columns'
+PROP_GLUE_TABLE_COLUMN_NAME = 'Name'
+PROP_GLUE_TABLE_COLUMN_TYPE = 'Type'
+PROP_GLUE_TABLE_COLUMN_COMMENT = 'Comment'
+PROP_GLUE_TABLE_COLUMN_PARAMETERS = 'Parameters'
+
+PROP_GLUE_TABLE_ICEBERG_FIELD_ID = 'iceberg.field.id'
+PROP_GLUE_TABLE_ICEBERG_FIELD_OPTIONAL = 'iceberg.field.optional'
+PROP_GLUE_TABLE_ICEBERG_FIELD_CURRENT = 'iceberg.field.current'
 
 PROP_GLUE_TABLELIST = "TableList"
 
@@ -84,15 +122,86 @@ PROP_GLUE_NEXT_TOKEN = "NextToken"
 GLUE_DESCRIPTION_KEY = "comment"
 
 
+@singledispatch
+def _to_type_string(iceberg_type: IcebergType) -> str:
+    return str(iceberg_type)
+
+@_to_type_string.register(LongType)
+def _(_: LongType) -> str:
+    return "bigint"
+
+@_to_type_string.register(TimeType)
+@_to_type_string.register(StringType)
+@_to_type_string.register(UUIDType)
+def _(_: Union[TimeType, StringType, UUIDType]) -> str:
+    return "string"
+
+@_to_type_string.register(FixedType)
+@_to_type_string.register(BinaryType)
+def _(_: Union[FixedType, BinaryType]) -> str:
+    return "binary"
+
+@_to_type_string.register(DecimalType)
+def _(decimal_type: DecimalType) -> str:
+    return f"decimal({decimal_type.precision},{decimal_type.scale})"
+
+@_to_type_string.register(StructType)
+def _(struct_type: StructType) -> str:
+    return f"struct<{','.join(map(_to_type_string, struct_type.fields))}>"
+
+@_to_type_string.register(NestedField)
+def _(nested_field: NestedField) -> str:
+    return f"{nested_field.name}:{_to_type_string(nested_field.field_type)}"
+
+@_to_type_string.register(ListType)
+def _(list_type: ListType) -> str:
+    return f"array<{_to_type_string(list_type.element_type)}>"
+
+@_to_type_string.register(MapType)
+def _(map_type: MapType) -> str:
+    return f"map<{_to_type_string(map_type.key_type)},{_to_type_string(map_type.value_type)}>"
+
+
+def _add_column_with_dedup(columns: List[Dict[str, Any]], dedupe: Set[str], field: NestedField, is_current: bool):
+    if field.name not in dedupe:
+        column = {
+            PROP_GLUE_TABLE_COLUMN_NAME: field.name,
+            PROP_GLUE_TABLE_COLUMN_TYPE: _to_type_string(field.field_type),
+            PROP_GLUE_TABLE_COLUMN_COMMENT: field.doc or "",
+            PROP_GLUE_TABLE_COLUMN_PARAMETERS: {
+                PROP_GLUE_TABLE_ICEBERG_FIELD_ID: str(field.field_id),
+                PROP_GLUE_TABLE_ICEBERG_FIELD_OPTIONAL: str(field.optional).lower(),
+                PROP_GLUE_TABLE_ICEBERG_FIELD_CURRENT: str(is_current).lower(),
+            }
+        }
+        columns.append(column)
+        dedupe.add(field.name)
+
+def _to_columns(schema: Schema) -> List[Dict[str, Any]]:
+    columns = []
+    added_names = set()
+
+    for field in schema.fields:
+        _add_column_with_dedup(columns, added_names, field, True)
+
+    return columns
+
+def _construct_storage_descriptor(location: str, schema: Schema) -> Dict[str, Any]:
+    return {
+        PROP_GLUE_TABLE_LOCATION: location,
+        PROP_GLUE_TABLE_COLUMNS: _to_columns(schema),
+    }
+
 def _construct_parameters(metadata_location: str) -> Properties:
     return {TABLE_TYPE: ICEBERG.upper(), METADATA_LOCATION: metadata_location}
 
 
-def _construct_create_table_input(table_name: str, metadata_location: str, properties: Properties) -> Dict[str, Any]:
+def _construct_create_table_input(table_name: str, location: str, metadata_location: str, schema: Schema, properties: Properties) -> Dict[str, Any]:
     table_input = {
         PROP_GLUE_TABLE_NAME: table_name,
         PROP_GLUE_TABLE_TYPE: EXTERNAL_TABLE,
         PROP_GLUE_TABLE_PARAMETERS: _construct_parameters(metadata_location),
+        PROP_GLUE_TABLE_STORAGE_DESCRIPTOR: _construct_storage_descriptor(location, schema),
     }
 
     if table_description := properties.get(GLUE_DESCRIPTION_KEY):
@@ -219,7 +328,7 @@ class GlueCatalog(Catalog):
         io = load_file_io(properties=self.properties, location=metadata_location)
         self._write_metadata(metadata, io, metadata_location)
 
-        table_input = _construct_create_table_input(table_name, metadata_location, properties)
+        table_input = _construct_create_table_input(table_name, location, metadata_location, schema, properties)
         database_name, table_name = self.identifier_to_database_and_table(identifier)
         self._create_glue_table(database_name=database_name, table_name=table_name, table_input=table_input)
 

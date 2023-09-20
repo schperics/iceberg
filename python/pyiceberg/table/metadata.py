@@ -66,6 +66,7 @@ SPEC_ID = "spec-id"
 FIELD_ID = "field-id"
 FIELDS = "fields"
 
+INITIAL_SNAPSHOT_ID = -1
 INITIAL_SEQUENCE_NUMBER = 0
 INITIAL_SPEC_ID = 0
 DEFAULT_SCHEMA_ID = 0
@@ -73,10 +74,10 @@ DEFAULT_SCHEMA_ID = 0
 
 def cleanup_snapshot_id(data: Dict[str, Any]) -> Dict[str, Any]:
     """Run before validation."""
-    if CURRENT_SNAPSHOT_ID in data and data[CURRENT_SNAPSHOT_ID] == -1:
+    if data.get("current_snapshot_id") is None:
         # We treat -1 and None the same, by cleaning this up
         # in a pre-validator, we can simplify the logic later on
-        data[CURRENT_SNAPSHOT_ID] = None
+        data["current_snapshot_id"] = INITIAL_SNAPSHOT_ID
     return data
 
 
@@ -119,7 +120,7 @@ def check_sort_orders(table_metadata: TableMetadata) -> TableMetadata:
 
 def construct_refs(table_metadata: TableMetadata) -> TableMetadata:
     """Set the main branch if missing."""
-    if table_metadata.current_snapshot_id is not None:
+    if table_metadata.current_snapshot_id != INITIAL_SNAPSHOT_ID:
         if MAIN_BRANCH not in table_metadata.refs:
             table_metadata.refs[MAIN_BRANCH] = SnapshotRef(
                 snapshot_id=table_metadata.current_snapshot_id, snapshot_ref_type=SnapshotRefType.BRANCH
@@ -177,7 +178,7 @@ class TableMetadataCommonFields(IcebergBaseModel):
     to be used for arbitrary metadata. For example, commit.retry.num-retries
     is used to control the number of commit retries."""
 
-    current_snapshot_id: Optional[int] = Field(alias="current-snapshot-id", default=None)
+    current_snapshot_id: Optional[int] = Field(alias="current-snapshot-id", default=INITIAL_SNAPSHOT_ID)
     """ID of the current table snapshot."""
 
     snapshots: List[Snapshot] = Field(default_factory=list)
@@ -234,6 +235,8 @@ class TableMetadataV1(TableMetadataCommonFields, IcebergBaseModel):
 
     @model_validator(mode="before")
     def cleanup_snapshot_id(cls, data: Dict[str, Any]) -> Dict[str, Any]:
+        from pprint import pprint
+        pprint(data)
         return cleanup_snapshot_id(data)
 
     @model_validator(mode="after")
